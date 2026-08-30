@@ -3,6 +3,7 @@ import asyncio
 import subprocess
 import tempfile
 from pathlib import Path
+import re
 
 import imageio_ffmpeg
 from telegram import Update
@@ -20,119 +21,347 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
 
-def edit_video(input_file: str, output_file: str):
-    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def run_cmd(command):
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr[-4000:])
+
+    return result
+
+
+def get_duration(path):
+    result = subprocess.run(
+        [FFMPEG, "-i", str(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    match = re.search(
+        r"Duration:\s*(\d+):(\d+):([\d.]+)",
+        result.stderr,
+    )
+
+    if not match:
+        return 15.0
+
+    h = int(match.group(1))
+    m = int(match.group(2))
+    s = float(match.group(3))
+
+    return h * 3600 + m * 60 + s
+
+
+def create_edit(video, music, output, instruction):
+    duration = get_duration(video)
+
+    # خروجی حداکثر 30 ثانیه و متناسب با ویدیوی ورودی
+    if duration <= 10:
+        target = duration
+    elif duration <= 15:
+        target = duration
+    elif duration <= 20:
+        target = duration
+    else:
+        target = min(duration, 30)
+
+    # ادیت عمودی مناسب TikTok / Reels
+    video_filter = (
+        "scale=1080:1920:"
+        "force_original_aspect_ratio=increase,"
+        "crop=1080:1920,"
+        "eq=contrast=1.08:"
+        "brightness=0.02:"
+        "saturation=1.10,"
+        "unsharp=5:5:0.55:5:5:0,"
+        "vignette=PI/7"
+    )
 
     command = [
-        ffmpeg,
+        FFMPEG,
         "-y",
-        "-i", input_file,
 
-        "-vf",
-        (
-            "scale=1280:720:force_original_aspect_ratio=increase,"
-            "crop=1280:720,"
-            "eq=contrast=1.12:brightness=0.02:saturation=1.12,"
-            "unsharp=5:5:0.7:5:5:0,"
-            "vignette=PI/5"
-        ),
+        "-i",
+        str(video),
 
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "20",
+        "-stream_loop",
+        "-1",
 
-        "-c:a", "aac",
-        "-b:a", "128k",
+        "-i",
+        str(music),
 
-        "-movflags", "+faststart",
-        output_file,
+        "-t",
+        str(target),
+
+        "-filter:v",
+        video_filter,
+
+        "-map",
+        "0:v:0",
+
+        "-map",
+        "1:a:0",
+
+        "-c:v",
+        "libx264",
+
+        "-preset",
+        "veryfast",
+
+        "-crf",
+        "18",
+
+        "-pix_fmt",
+        "yuv420p",
+
+        "-c:a",
+        "aac",
+
+        "-b:a",
+        "192k",
+
+        "-shortest",
+
+        "-movflags",
+        "+faststart",
+
+        str(output),
     ]
 
-    subprocess.run(
-        command,
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
+    run_cmd(command)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+
     await update.message.reply_text(
-        "🔥 Madrid Era Editor آماده است!\n\n"
-        "ویدیوت رو بفرست تا ادیتش کنم."
+        "👑 MADRID ERA CONTROL\n\n"
+        "🎬 ویدیو را بفرست.\n"
+        "🎵 بعد آهنگ را بفرست.\n"
+        "📝 در آخر دستور ادیت را بنویس.\n\n"
+        "مثال:\n"
+        "ادیت سریع و مدرن، مناسب TikTok"
     )
 
 
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
 
     if not message.video and not message.document:
         return
 
-    status = await message.reply_text("🎬 دارم ویدیو رو ادیت می‌کنم...")
+    status = await message.reply_text(
+        "🎬 ویدیو دریافت شد.\n\n"
+        "🎵 حالا آهنگ را بفرست."
+    )
 
-    input_path = None
-    output_path = None
+    video_path = tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".mp4",
+    ).name
 
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_dir = Path(temp_dir)
+        if message.video:
+            telegram_file = await message.video.get_file()
+        else:
+            telegram_file = await message.document.get_file()
 
-            input_path = temp_dir / "input.mp4"
-            output_path = temp_dir / "madrid_era_edit.mp4"
+        await telegram_file.download_to_drive(video_path)
 
-            if message.video:
-                file = await message.video.get_file()
-            else:
-                file = await message.document.get_file()
-
-            await file.download_to_drive(str(input_path))
-
-            loop = asyncio.get_running_loop()
-
-            await loop.run_in_executor(
-                None,
-                edit_video,
-                str(input_path),
-                str(output_path),
-            )
-
-            await status.edit_text("✅ ادیت آماده شد! در حال ارسال...")
-
-            with open(output_path, "rb") as video_file:
-                await message.reply_video(
-                    video=video_file,
-                    caption="🔥 Madrid Era Edit"
-                )
-
-            await status.delete()
+        context.user_data["video"] = video_path
 
     except Exception as e:
-        print("ERROR:", repr(e))
+        print("VIDEO ERROR:", repr(e))
+
+        try:
+            os.remove(video_path)
+        except:
+            pass
+
         await status.edit_text(
-            "❌ موقع ادیت ویدیو خطا پیش آمد.\n"
-            "لاگ Railway را بررسی می‌کنیم."
+            "❌ دریافت ویدیو ناموفق بود."
         )
+
+
+async def receive_music(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+
+    if not message.audio and not message.document:
+        return
+
+    if not context.user_data.get("video"):
+        await message.reply_text(
+            "⚠️ اول ویدیو را بفرست."
+        )
+        return
+
+    status = await message.reply_text(
+        "🎵 دارم آهنگ را دریافت می‌کنم..."
+    )
+
+    music_path = tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".mp3",
+    ).name
+
+    try:
+        if message.audio:
+            telegram_file = await message.audio.get_file()
+        else:
+            telegram_file = await message.document.get_file()
+
+        await telegram_file.download_to_drive(music_path)
+
+        context.user_data["music"] = music_path
+
+        await status.edit_text(
+            "✅ آهنگ دریافت و ذخیره شد.\n\n"
+            "📝 حالا دستور ادیتت را بنویس."
+        )
+
+    except Exception as e:
+        print("MUSIC ERROR:", repr(e))
+
+        try:
+            os.remove(music_path)
+        except:
+            pass
+
+        await status.edit_text(
+            "❌ دریافت آهنگ ناموفق بود."
+        )
+
+
+async def receive_instruction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    instruction = update.message.text.strip()
+
+    video = context.user_data.get("video")
+    music = context.user_data.get("music")
+
+    # لینک نمونه فعلاً فقط ذخیره می‌شود
+    if instruction.startswith("http://") or instruction.startswith("https://"):
+        context.user_data["reference"] = instruction
+
+        await update.message.reply_text(
+            "🔗 لینک نمونه دریافت شد.\n\n"
+            "📝 حالا دستور ادیت را بنویس."
+        )
+        return
+
+    if not video:
+        await update.message.reply_text(
+            "⚠️ اول ویدیو را بفرست."
+        )
+        return
+
+    if not music:
+        await update.message.reply_text(
+            "⚠️ اول آهنگ را بفرست."
+        )
+        return
+
+    status = await update.message.reply_text(
+        "🔥 دستور دریافت شد.\n\n"
+        "🎬 در حال ساخت ویدیو...\n"
+        "⏳ کمی صبر کن."
+    )
+
+    output = tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".mp4",
+    ).name
+
+    try:
+        loop = asyncio.get_running_loop()
+
+        await loop.run_in_executor(
+            None,
+            create_edit,
+            video,
+            music,
+            output,
+            instruction,
+        )
+
+        await status.edit_text(
+            "✅ ادیت آماده شد!\n"
+            "📤 در حال ارسال..."
+        )
+
+        with open(output, "rb") as video_file:
+            await update.message.reply_video(
+                video=video_file,
+                caption="👑 MADRID ERA EDIT",
+                supports_streaming=True,
+            )
+
+        await status.delete()
+
+    except Exception as e:
+        print("EDIT ERROR:", repr(e))
+
+        await status.edit_text(
+            "❌ پردازش انجام نشد.\n"
+            "اگر دوباره خطا داد، متن Logs را برایم بفرست."
+        )
+
+    finally:
+        for path in [video, music, output]:
+            if path:
+                try:
+                    os.remove(path)
+                except:
+                    pass
+
+        context.user_data.clear()
 
 
 def main():
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .post_init(lambda application: application.bot.delete_webhook(drop_pending_updates=True))
+        .connect_timeout(30)
+        .read_timeout(120)
+        .write_timeout(120)
+        .pool_timeout(30)
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(
+        CommandHandler("start", start)
+    )
 
     app.add_handler(
         MessageHandler(
             filters.VIDEO | filters.Document.VIDEO,
-            handle_video
+            receive_video,
         )
     )
 
-    print("MADRID ERA BOT1 IS RUNNING...")
+    app.add_handler(
+        MessageHandler(
+            filters.AUDIO | filters.Document.AUDIO,
+            receive_music,
+        )
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            receive_instruction,
+        )
+    )
+
+    print("👑 MADRID ERA CONTROL IS RUNNING...")
 
     app.run_polling(
         drop_pending_updates=True,
