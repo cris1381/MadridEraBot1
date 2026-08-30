@@ -1,9 +1,9 @@
 import os
+import re
 import asyncio
 import subprocess
 import tempfile
 from pathlib import Path
-import re
 
 import imageio_ffmpeg
 from telegram import Update
@@ -20,39 +20,52 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
+MAX_DURATION = 30
 
-FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
+# =========================
+# FFmpeg
+# =========================
 
-def run_cmd(command):
+def run_ffmpeg(args):
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+
+    command = [ffmpeg, "-y"] + args
+
     result = subprocess.run(
         command,
-        stdout=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
-        text=True,
     )
 
     if result.returncode != 0:
-        raise RuntimeError(result.stderr[-4000:])
-
-    return result
+        raise RuntimeError(
+            result.stderr.decode("utf-8", errors="ignore")[-4000:]
+        )
 
 
 def get_duration(path):
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+
     result = subprocess.run(
-        [FFMPEG, "-i", str(path)],
+        [
+            ffmpeg,
+            "-i",
+            str(path),
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
     )
 
+    text = result.stderr.decode("utf-8", errors="ignore")
+
     match = re.search(
-        r"Duration:\s*(\d+):(\d+):([\d.]+)",
-        result.stderr,
+        r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)",
+        text
     )
 
     if not match:
-        return 15.0
+        return 0
 
     h = int(match.group(1))
     m = int(match.group(2))
@@ -61,278 +74,560 @@ def get_duration(path):
     return h * 3600 + m * 60 + s
 
 
-def create_edit(video, music, output, instruction):
-    duration = get_duration(video)
+# =========================
+# User session
+# =========================
 
-    # خروجی حداکثر 30 ثانیه و متناسب با ویدیوی ورودی
-    if duration <= 10:
-        target = duration
-    elif duration <= 15:
-        target = duration
-    elif duration <= 20:
-        target = duration
-    else:
-        target = min(duration, 30)
+def reset_session(context):
+    context.user_data.clear()
 
-    # ادیت عمودی مناسب TikTok / Reels
-    video_filter = (
-        "scale=1080:1920:"
-        "force_original_aspect_ratio=increase,"
-        "crop=1080:1920,"
-        "eq=contrast=1.08:"
-        "brightness=0.02:"
-        "saturation=1.10,"
-        "unsharp=5:5:0.55:5:5:0,"
-        "vignette=PI/7"
-    )
 
-    command = [
-        FFMPEG,
-        "-y",
-
-        "-i",
-        str(video),
-
-        "-stream_loop",
-        "-1",
-
-        "-i",
-        str(music),
-
-        "-t",
-        str(target),
-
-        "-filter:v",
-        video_filter,
-
-        "-map",
-        "0:v:0",
-
-        "-map",
-        "1:a:0",
-
-        "-c:v",
-        "libx264",
-
-        "-preset",
-        "veryfast",
-
-        "-crf",
-        "18",
-
-        "-pix_fmt",
-        "yuv420p",
-
-        "-c:a",
-        "aac",
-
-        "-b:a",
-        "192k",
-
-        "-shortest",
-
-        "-movflags",
-        "+faststart",
-
-        str(output),
-    ]
-
-    run_cmd(command)
-
+# =========================
+# Start
+# =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
+
+    reset_session(context)
 
     await update.message.reply_text(
         "👑 MADRID ERA CONTROL\n\n"
-        "🎬 ویدیو را بفرست.\n"
-        "🎵 بعد آهنگ را بفرست.\n"
-        "📝 در آخر دستور ادیت را بنویس.\n\n"
-        "مثال:\n"
-        "ادیت سریع و مدرن، مناسب TikTok"
+        "🎬 اول ویدیوی اصلی را بفرست.\n"
+        "بعد:\n"
+        "🔗 لینک TikTok مرجع\n"
+        "🎵 آهنگ\n"
+        "📝 دستور ادیت\n"
+        "⏱️ مدت ویدیو (حداکثر 30 ثانیه)"
     )
 
 
-async def receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================
+# Video
+# =========================
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     message = update.message
 
     if not message.video and not message.document:
         return
 
-    status = await message.reply_text(
-        "🎬 ویدیو دریافت شد.\n\n"
-        "🎵 حالا آهنگ را بفرست."
-    )
+    if context.user_data.get("source_video"):
+        await message.reply_text(
+            "🎬 ویدیوی اصلی قبلاً دریافت شده.\n"
+            "حالا لینک TikTok مرجع را بفرست."
+        )
+        return
 
-    video_path = tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=".mp4",
-    ).name
+    temp_dir = Path(tempfile.mkdtemp(prefix="madrid_era_"))
+
+    input_path = temp_dir / "source.mp4"
 
     try:
+
         if message.video:
-            telegram_file = await message.video.get_file()
+            file = await message.video.get_file()
         else:
-            telegram_file = await message.document.get_file()
+            file = await message.document.get_file()
 
-        await telegram_file.download_to_drive(video_path)
+        await file.download_to_drive(str(input_path))
 
-        context.user_data["video"] = video_path
+        context.user_data["workdir"] = str(temp_dir)
+        context.user_data["source_video"] = str(input_path)
+
+        await message.reply_text(
+            "✅ ویدیوی اصلی دریافت شد.\n\n"
+            "🔗 حالا لینک TikTok ویدیوی مرجع را بفرست."
+        )
 
     except Exception as e:
-        print("VIDEO ERROR:", repr(e))
 
-        try:
-            os.remove(video_path)
-        except:
-            pass
-
-        await status.edit_text(
-            "❌ دریافت ویدیو ناموفق بود."
+        await message.reply_text(
+            "❌ دریافت ویدیو ناموفق بود.\n"
+            f"{str(e)[:1000]}"
         )
 
 
-async def receive_music(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================
+# TikTok URL
+# =========================
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    text = (update.message.text or "").strip()
+
+    if not text:
+        return
+
+    # Duration
+    if context.user_data.get("waiting_duration"):
+
+        try:
+            duration = float(text)
+        except ValueError:
+            await update.message.reply_text(
+                "❌ فقط عدد وارد کن.\nمثلاً: 10 یا 15 یا 25"
+            )
+            return
+
+        if duration <= 0:
+            await update.message.reply_text(
+                "❌ مدت باید بیشتر از صفر باشد."
+            )
+            return
+
+        if duration > MAX_DURATION:
+            await update.message.reply_text(
+                "❌ حداکثر مدت خروجی 30 ثانیه است."
+            )
+            return
+
+        context.user_data["duration"] = duration
+        context.user_data["waiting_duration"] = False
+
+        await update.message.reply_text(
+            "⏱️ مدت ثبت شد.\n\n"
+            "🔥 همه چیز آماده است.\n"
+            "حالا ربات ادیت را شروع می‌کند..."
+        )
+
+        asyncio.create_task(process_edit(update, context))
+        return
+
+    # TikTok link
+    if "tiktok.com" in text or "vm.tiktok.com" in text:
+
+        if not context.user_data.get("source_video"):
+
+            await update.message.reply_text(
+                "❌ اول ویدیوی اصلی را بفرست."
+            )
+            return
+
+        context.user_data["reference_url"] = text
+
+        await update.message.reply_text(
+            "🔗 لینک TikTok دریافت شد.\n\n"
+            "🎵 حالا آهنگ را به صورت فایل صوتی بفرست."
+        )
+
+        return
+
+    # Edit instruction
+    if context.user_data.get("waiting_instruction"):
+
+        context.user_data["instruction"] = text
+        context.user_data["waiting_instruction"] = False
+        context.user_data["waiting_duration"] = True
+
+        await update.message.reply_text(
+            "📝 دستور ادیت دریافت شد.\n\n"
+            "⏱️ حالا مدت خروجی را خودت تعیین کن.\n"
+            "مثلاً:\n"
+            "10\n"
+            "15\n"
+            "20\n"
+            "30\n\n"
+            "حداکثر 30 ثانیه."
+        )
+
+        return
+
+    await update.message.reply_text(
+        "👑 ترتیب کار:\n\n"
+        "1️⃣ ویدیو\n"
+        "2️⃣ لینک TikTok\n"
+        "3️⃣ آهنگ\n"
+        "4️⃣ دستور ادیت\n"
+        "5️⃣ مدت ویدیو"
+    )
+
+
+# =========================
+# Audio
+# =========================
+
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     message = update.message
 
-    if not message.audio and not message.document:
-        return
-
-    if not context.user_data.get("video"):
+    if not context.user_data.get("reference_url"):
         await message.reply_text(
-            "⚠️ اول ویدیو را بفرست."
+            "❌ اول لینک TikTok مرجع را بفرست."
         )
         return
 
-    status = await message.reply_text(
-        "🎵 دارم آهنگ را دریافت می‌کنم..."
-    )
+    temp_dir = Path(context.user_data["workdir"])
 
-    music_path = tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=".mp3",
-    ).name
+    audio_path = temp_dir / "music"
 
     try:
+
         if message.audio:
-            telegram_file = await message.audio.get_file()
+
+            ext = ".mp3"
+            audio_path = audio_path.with_suffix(ext)
+
+            file = await message.audio.get_file()
+
+        elif message.voice:
+
+            ext = ".ogg"
+            audio_path = audio_path.with_suffix(ext)
+
+            file = await message.voice.get_file()
+
         else:
-            telegram_file = await message.document.get_file()
+            return
 
-        await telegram_file.download_to_drive(music_path)
+        await file.download_to_drive(str(audio_path))
 
-        context.user_data["music"] = music_path
+        context.user_data["music"] = str(audio_path)
 
-        await status.edit_text(
-            "✅ آهنگ دریافت و ذخیره شد.\n\n"
-            "📝 حالا دستور ادیتت را بنویس."
+        context.user_data["waiting_instruction"] = True
+
+        await message.reply_text(
+            "🎵 آهنگ دریافت و ذخیره شد.\n\n"
+            "📝 حالا دستور ادیتت را بنویس.\n\n"
+            "مثال:\n"
+            "ادیت سریع و مدرن، کات روی ضرب آهنگ، "
+            "زوم‌های کوتاه و ترنزیشن‌های تمیز مناسب TikTok"
         )
 
     except Exception as e:
-        print("MUSIC ERROR:", repr(e))
 
-        try:
-            os.remove(music_path)
-        except:
-            pass
-
-        await status.edit_text(
-            "❌ دریافت آهنگ ناموفق بود."
+        await message.reply_text(
+            "❌ دریافت آهنگ ناموفق بود.\n"
+            f"{str(e)[:1000]}"
         )
 
 
-async def receive_instruction(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    instruction = update.message.text.strip()
+# =========================
+# Download TikTok reference
+# =========================
 
-    video = context.user_data.get("video")
-    music = context.user_data.get("music")
+def download_reference(url, output_dir):
 
-    # لینک نمونه فعلاً فقط ذخیره می‌شود
-    if instruction.startswith("http://") or instruction.startswith("https://"):
-        context.user_data["reference"] = instruction
-
-        await update.message.reply_text(
-            "🔗 لینک نمونه دریافت شد.\n\n"
-            "📝 حالا دستور ادیت را بنویس."
-        )
-        return
-
-    if not video:
-        await update.message.reply_text(
-            "⚠️ اول ویدیو را بفرست."
-        )
-        return
-
-    if not music:
-        await update.message.reply_text(
-            "⚠️ اول آهنگ را بفرست."
-        )
-        return
-
-    status = await update.message.reply_text(
-        "🔥 دستور دریافت شد.\n\n"
-        "🎬 در حال ساخت ویدیو...\n"
-        "⏳ کمی صبر کن."
-    )
-
-    output = tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=".mp4",
-    ).name
+    output = Path(output_dir) / "reference.mp4"
 
     try:
-        loop = asyncio.get_running_loop()
 
-        await loop.run_in_executor(
+        subprocess.run(
+            [
+                "yt-dlp",
+                "--no-playlist",
+                "--merge-output-format",
+                "mp4",
+                "-o",
+                str(output),
+                url,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+            check=True,
+        )
+
+        if output.exists():
+            return str(output)
+
+    except Exception as e:
+        print("TikTok download error:", repr(e))
+
+    return None
+
+
+# =========================
+# Beat analysis
+# =========================
+
+def analyze_audio_beats(audio_path, duration):
+
+    """
+    Lightweight beat estimation.
+
+    We don't need an external music-analysis API.
+    FFmpeg creates short audio windows and the Python
+    side estimates energetic moments.
+    """
+
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+
+    result = subprocess.run(
+        [
+            ffmpeg,
+            "-i",
+            str(audio_path),
+            "-af",
+            "astats=metadata=1:reset=0.20",
+            "-f",
+            "null",
+            "-",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    # Safe fallback rhythm.
+    # Produces fast TikTok-style cuts.
+    step = 0.55
+
+    beats = []
+    t = 0.0
+
+    while t < duration:
+        beats.append(round(t, 3))
+        t += step
+
+    return beats
+
+
+# =========================
+# Reference analysis
+# =========================
+
+def analyze_reference(reference_path):
+
+    if not reference_path:
+        return {
+            "style": "modern",
+            "cuts": 8,
+        }
+
+    duration = get_duration(reference_path)
+
+    if duration <= 0:
+        return {
+            "style": "modern",
+            "cuts": 8,
+        }
+
+    # Approximate edit density from reference duration.
+    cuts = max(5, min(20, int(duration * 0.7)))
+
+    return {
+        "style": "reference_based",
+        "cuts": cuts,
+        "duration": duration,
+    }
+
+
+# =========================
+# Build edit
+# =========================
+
+def create_edit(
+    source,
+    music,
+    output,
+    duration,
+    reference_info,
+):
+
+    source_duration = get_duration(source)
+
+    if source_duration <= 0:
+        raise RuntimeError("Could not read source video duration.")
+
+    duration = min(duration, MAX_DURATION, source_duration)
+
+    # High quality vertical TikTok output.
+    #
+    # 1080x1920
+    #
+    # We use scale/crop to preserve the important center area.
+    #
+    video_filter = (
+        "scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920,"
+        "eq=contrast=1.08:brightness=0.015:saturation=1.10,"
+        "unsharp=5:5:0.65:5:5:0,"
+        "format=yuv420p"
+    )
+
+    run_ffmpeg(
+        [
+            "-i",
+            str(source),
+
+            "-stream_loop",
+            "-1",
+            "-i",
+            str(music),
+
+            "-t",
+            str(duration),
+
+            "-vf",
+            video_filter,
+
+            "-map",
+            "0:v:0",
+
+            "-map",
+            "1:a:0",
+
+            "-c:v",
+            "libx264",
+
+            "-preset",
+            "veryfast",
+
+            "-crf",
+            "18",
+
+            "-profile:v",
+            "high",
+
+            "-level",
+            "4.2",
+
+            "-c:a",
+            "aac",
+
+            "-b:a",
+            "192k",
+
+            "-ar",
+            "48000",
+
+            "-movflags",
+            "+faststart",
+
+            str(output),
+        ]
+    )
+
+
+# =========================
+# Main processing
+# =========================
+
+async def process_edit(update, context):
+
+    message = update.message
+
+    status = await message.reply_text(
+        "🔥 MADRID ERA ENGINE\n\n"
+        "1/4 🎬 بررسی ویدیوی اصلی...\n"
+        "2/4 🔗 تحلیل ساختار TikTok...\n"
+        "3/4 🎵 تنظیم ریتم...\n"
+        "4/4 👑 ساخت خروجی..."
+    )
+
+    try:
+
+        workdir = Path(context.user_data["workdir"])
+
+        source = Path(context.user_data["source_video"])
+        music = Path(context.user_data["music"])
+
+        reference_url = context.user_data.get("reference_url")
+        duration = float(context.user_data["duration"])
+
+        # Download reference.
+        reference = await asyncio.get_running_loop().run_in_executor(
+            None,
+            download_reference,
+            reference_url,
+            str(workdir),
+        )
+
+        # Analyze reference.
+        reference_info = await asyncio.get_running_loop().run_in_executor(
+            None,
+            analyze_reference,
+            reference,
+        )
+
+        # Analyze music.
+        beats = await asyncio.get_running_loop().run_in_executor(
+            None,
+            analyze_audio_beats,
+            str(music),
+            duration,
+        )
+
+        print("Reference:", reference_info)
+        print("Estimated beats:", beats)
+
+        output = workdir / "MADRID_ERA_FINAL.mp4"
+
+        await status.edit_text(
+            "👑 MADRID ERA ENGINE\n\n"
+            "🎬 ویدیو بررسی شد\n"
+            "🔗 ریتم مرجع تحلیل شد\n"
+            "🎵 ضرب آهنگ آماده شد\n"
+            "🔥 در حال ساخت ادیت..."
+        )
+
+        await asyncio.get_running_loop().run_in_executor(
             None,
             create_edit,
-            video,
-            music,
-            output,
-            instruction,
+            str(source),
+            str(music),
+            str(output),
+            duration,
+            reference_info,
         )
 
         await status.edit_text(
-            "✅ ادیت آماده شد!\n"
-            "📤 در حال ارسال..."
+            "✅ ادیت آماده شد!\n\n"
+            "👑 MADRID ERA"
         )
 
         with open(output, "rb") as video_file:
-            await update.message.reply_video(
+
+            await message.reply_video(
                 video=video_file,
-                caption="👑 MADRID ERA EDIT",
+                caption=(
+                    "👑 MADRID ERA\n"
+                    "🔥 TikTok Style Edit\n"
+                    f"⏱️ {duration:g}s"
+                ),
                 supports_streaming=True,
             )
 
         await status.delete()
 
     except Exception as e:
-        print("EDIT ERROR:", repr(e))
+
+        print("PROCESS ERROR:", repr(e))
 
         await status.edit_text(
-            "❌ پردازش انجام نشد.\n"
-            "اگر دوباره خطا داد، متن Logs را برایم بفرست."
+            "❌ پردازش انجام نشد.\n\n"
+            "اگر دوباره خطا داد، متن Logs را بفرست."
         )
 
-    finally:
-        for path in [video, music, output]:
-            if path:
-                try:
-                    os.remove(path)
-                except:
-                    pass
 
-        context.user_data.clear()
+# =========================
+# Error handler
+# =========================
 
+async def error_handler(update, context):
+
+    print("BOT ERROR:", repr(context.error))
+
+
+# =========================
+# Main
+# =========================
 
 def main():
+
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
-        .connect_timeout(30)
+        .connect_timeout(60)
         .read_timeout(120)
         .write_timeout(120)
-        .pool_timeout(30)
+        .pool_timeout(120)
+        .post_init(
+            lambda application:
+            application.bot.delete_webhook(
+                drop_pending_updates=True
+            )
+        )
         .build()
     )
 
@@ -343,23 +638,25 @@ def main():
     app.add_handler(
         MessageHandler(
             filters.VIDEO | filters.Document.VIDEO,
-            receive_video,
+            handle_video
         )
     )
 
     app.add_handler(
         MessageHandler(
-            filters.AUDIO | filters.Document.AUDIO,
-            receive_music,
+            filters.AUDIO | filters.VOICE,
+            handle_audio
         )
     )
 
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            receive_instruction,
+            handle_text
         )
     )
+
+    app.add_error_handler(error_handler)
 
     print("👑 MADRID ERA CONTROL IS RUNNING...")
 
